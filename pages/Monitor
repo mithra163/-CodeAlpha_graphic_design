@@ -1,0 +1,267 @@
+import React, { useState, useEffect, useRef } from "react";
+import { base44 } from "@/api/base44Client";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Play, Square, Volume2, VolumeX } from "lucide-react";
+
+import LiveCameraFeed from "../components/monitoring/LiveCameraFeed";
+import DetectionStatus from "../components/monitoring/DetectionStatus";
+import AlertPanel from "../components/monitoring/AlertPanel";
+import VoiceAnnouncer from "../components/monitoring/VoiceAnnouncer";
+
+export default function MonitorPage() {
+  const [isMonitoring, setIsMonitoring] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [detectionResult, setDetectionResult] = useState(null);
+  const [cameraLocation, setCameraLocation] = useState("Manufacturing Unit A");
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [voiceMessage, setVoiceMessage] = useState(null);
+  const [shouldSpeak, setShouldSpeak] = useState(false);
+  const detectionIntervalRef = useRef(null);
+  const videoRef = useRef(null);
+  const queryClient = useQueryClient();
+
+  const { data: violations = [] } = useQuery({
+    queryKey: ['violations'],
+    queryFn: () => base44.entities.PPEViolation.list('-timestamp', 50),
+    refetchInterval: 5000
+  });
+
+  const createViolationMutation = useMutation({
+    mutationFn: (data) => base44.entities.PPEViolation.create(data),
+    onSuccess: () => {
+      queryClient.invalidateQueries(['violations']);
+    }
+  });
+
+  const updateViolationMutation = useMutation({
+    mutationFn: ({ id, data }) => base44.entities.PPEViolation.update(id, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries(['violations']);
+    }
+  });
+
+  const captureFrame = async () => {
+    const video = document.querySelector('video');
+    if (!video) return null;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0);
+
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => {
+        resolve(blob);
+      }, 'image/jpeg', 0.8);
+    });
+  };
+
+  const detectPPE = async () => {
+    if (isDetecting) return;
+    
+    setIsDetecting(true);
+    
+    try {
+      const frameBlob = await captureFrame();
+      if (!frameBlob) {
+        setIsDetecting(false);
+        return;
+      }
+
+      const file = new File([frameBlob], `frame-${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const { file_url } = await base44.integrations.Core.UploadFile({ file });
+
+      const result = await base44.integrations.Core.InvokeLLM({
+        prompt: `Analyze this image and detect if the person is wearing proper Personal Protective Equipment (PPE). 
+        
+Check for:
+1. Helmet/Hard hat
+2. Safety gloves
+3. High-visibility safety vest
+
+Return a JSON with:
+- missing_equipment: array of items that are NOT being worn (possible values: "helmet", "gloves", "safety_vest")
+- confidence: your confidence level (0-100)
+- description: brief description of what you see
+
+If no person is visible or image is unclear, return empty missing_equipment array.`,
+        file_urls: [file_url],
+        response_json_schema: {
+          type: "object",
+          properties: {
+            missing_equipment: {
+              type: "array",
+              items: { type: "string" }
+            },
+            confidence: { type: "number" },
+            description: { type: "string" }
+          }
+        }
+      });
+
+      setDetectionResult(result);
+
+      // Create violation record if PPE is missing
+      if (result.missing_equipment && result.missing_equipment.length > 0) {
+        const severity = result.missing_equipment.includes('helmet') ? 'critical' :
+                        result.missing_equipment.length >= 2 ? 'high' : 'medium';
+
+        await createViolationMutation.mutateAsync({
+          timestamp: new Date().toISOString(),
+          missing_equipment: result.missing_equipment,
+          location: cameraLocation,
+          severity: severity,
+          snapshot_url: file_url,
+          acknowledged: false
+        });
+
+        // Trigger voice announcement
+        if (voiceEnabled) {
+          const missingItems = result.missing_equipment
+            .map(item => item.replace('_', ' '))
+            .join(', ');
+          
+          const message = `Attention! Safety violation detected in ${cameraLocation}. ` +
+                         `Worker is not wearing ${missingItems}. ` +
+                         `Please put on your safety equipment immediately.`;
+          
+          setVoiceMessage(message);
+          setShouldSpeak(true);
+          
+          setTimeout(() => setShouldSpeak(false), 100);
+        }
+      }
+
+    } catch (error) {
+      console.error("Detection error:", error);
+    }
+    
+    setIsDetecting(false);
+  };
+
+  const startMonitoring = () => {
+    setIsMonitoring(true);
+    detectPPE();
+    detectionIntervalRef.current = setInterval(() => {
+      detectPPE();
+    }, 8000); // Check every 8 seconds
+  };
+
+  const stopMonitoring = () => {
+    setIsMonitoring(false);
+    if (detectionIntervalRef.current) {
+      clearInterval(detectionIntervalRef.current);
+      detectionIntervalRef.current = null;
+    }
+  };
+
+  const handleAcknowledge = async (violationId) => {
+    await updateViolationMutation.mutateAsync({
+      id: violationId,
+      data: { acknowledged: true }
+    });
+  };
+
+  useEffect(() => {
+    return () => {
+      if (detectionIntervalRef.current) {
+        clearInterval(detectionIntervalRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 p-4 md:p-8">
+      <VoiceAnnouncer message={voiceMessage} shouldSpeak={shouldSpeak} />
+      
+      <div className="max-w-7xl mx-auto">
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900">PPE Safety Monitor</h1>
+            <p className="text-gray-500 mt-1">Real-time Personal Protective Equipment detection</p>
+          </div>
+          <div className="flex items-center gap-3">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => setVoiceEnabled(!voiceEnabled)}
+              className={voiceEnabled ? "bg-green-50 border-green-200" : ""}
+            >
+              {voiceEnabled ? (
+                <Volume2 className="w-5 h-5 text-green-600" />
+              ) : (
+                <VolumeX className="w-5 h-5 text-gray-400" />
+              )}
+            </Button>
+            {!isMonitoring ? (
+              <Button 
+                onClick={startMonitoring}
+                size="lg"
+                className="bg-green-600 hover:bg-green-700"
+              >
+                <Play className="w-5 h-5 mr-2" />
+                Start Monitoring
+              </Button>
+            ) : (
+              <Button 
+                onClick={stopMonitoring}
+                size="lg"
+                variant="destructive"
+              >
+                <Square className="w-5 h-5 mr-2" />
+                Stop Monitoring
+              </Button>
+            )}
+          </div>
+        </div>
+
+        <div className="mb-6">
+          <Card>
+            <CardContent className="p-4">
+              <div className="flex items-center gap-4">
+                <Label htmlFor="location" className="whitespace-nowrap font-semibold">
+                  Camera Location:
+                </Label>
+                <Input
+                  id="location"
+                  value={cameraLocation}
+                  onChange={(e) => setCameraLocation(e.target.value)}
+                  placeholder="e.g., Manufacturing Unit A"
+                  className="max-w-xs"
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <div className="grid lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 space-y-6">
+            <LiveCameraFeed
+              onDetectionResult={setDetectionResult}
+              isDetecting={isDetecting}
+              detectionResult={detectionResult}
+              cameraLocation={cameraLocation}
+            />
+          </div>
+
+          <div className="space-y-6">
+            <DetectionStatus 
+              detectionResult={detectionResult}
+              isDetecting={isDetecting}
+            />
+            
+            <AlertPanel 
+              violations={violations}
+              onAcknowledge={handleAcknowledge}
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
